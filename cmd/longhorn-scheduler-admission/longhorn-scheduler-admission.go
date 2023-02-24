@@ -123,6 +123,17 @@ func run(cli kubernetes.Interface) error {
 			}
 		}
 
+		// Check if we're a RWX share-manager.
+		for k, v := range pod.Labels {
+			if k != "longhorn.io/component" {
+				continue
+			}
+			if v == "share-manager" {
+				pod.Spec.SchedulerName = cfg.schedulerName
+				break
+			}
+		}
+
 		return &kwhmutating.MutatorResult{MutatedObject: pod}, nil
 	})
 

@@ -3,6 +3,7 @@ package longhorn
 import (
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	snapv1 "github.com/kubernetes-incubator/external-storage/snapshot/pkg/apis/crd/v1"
@@ -125,9 +126,16 @@ func (l *longhorn) InspectVolume(volumeID string) (*storkvolume.Info, error) {
 	}
 
 	var nodes []string
-	for _, r := range vol.Replicas {
-		// TODO: check replica state and node selector
-		nodes = append(nodes, r.HostId)
+
+	// If this is a RWX volume, only give weight to the share manager's node.
+	if smNode := l.getShareManagerNode(vol); smNode != "" {
+		logrus.Debugf("Found share-manager for %s on %s", volumeID, smNode)
+		nodes = append(nodes, smNode)
+	} else {
+		for _, r := range vol.Replicas {
+			// TODO: check replica state and node selector
+			nodes = append(nodes, r.HostId)
+		}
 	}
 
 	return &storkvolume.Info{
@@ -136,6 +144,35 @@ func (l *longhorn) InspectVolume(volumeID string) (*storkvolume.Info, error) {
 		DataNodes:  nodes,
 		Size:       size,
 	}, nil
+}
+
+// shareManager returns the share manager's node if this is a RWX volume.
+func (l *longhorn) getShareManagerNode(vol *client.Volume) string {
+	if vol == nil {
+		return ""
+	}
+
+	pods, err := core.Instance().GetPods("longhorn-system", map[string]string{
+		"longhorn.io/component": "share-manager",
+	})
+	if err != nil {
+		logrus.Warnf("Error getting share-manager pods: %v", err)
+		return ""
+	}
+
+	for _, p := range pods.Items {
+		managedVol, ok := p.Labels["longhorn.io/share-manager"]
+		if !ok {
+			continue
+		}
+		if managedVol != vol.Name {
+			continue
+		}
+
+		return p.Spec.NodeName
+	}
+
+	return ""
 }
 
 func (l *longhorn) getNodeLabels(nodeInfo *storkvolume.NodeInfo) (map[string]string, error) {
@@ -236,6 +273,7 @@ func (l *longhorn) GetPodVolumes(podSpec *v1.PodSpec, namespace string, includeP
 					}
 				}
 			}
+
 			volumeName = pvc.Spec.VolumeName
 		}
 
@@ -254,6 +292,27 @@ func (l *longhorn) GetPodVolumes(podSpec *v1.PodSpec, namespace string, includeP
 			}
 		}
 	}
+
+	// If this is an RWX NFS share manager pod, include its volume too. Hacky
+	// because we only have the spec, not labels to tell us which PVC it
+	// serves.
+	for _, c := range podSpec.Containers {
+		if c.Name != "share-manager" {
+			continue
+		}
+		for _, a := range c.Args {
+			if !strings.HasPrefix(a, "pvc-") {
+				continue
+			}
+			volumeInfo, err := l.InspectVolume(a)
+			if err != nil {
+				break
+			}
+			volumes = append(volumes, volumeInfo)
+
+		}
+	}
+
 	return volumes, pendingWFFCVolumes, nil
 }
 
